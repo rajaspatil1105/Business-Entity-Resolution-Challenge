@@ -22,3 +22,6 @@ MAX_DF = 0.2         # drop tokens/3-grams present in more than this share of a 
 MIN_SIM = 0.05        # ignore retrieval scores below this
 Q_CHUNK = 100_000     # S1 queries per matrix product
 N_THREADS = os.cpu_count() or 4
+
+NAME_NGRAM = (3, 3)   # char n-gram range of the name blocker
+REV_K = 5             # reverse name blocker: top S1 kept per S2/S3 record (0 = off)

@@ -1,10 +1,12 @@
 """Step 2: candidate generation (blocking).
 
-Per country and per source (S2, S3), three TF-IDF blockers retrieve the top-k records for
-every Source 1 query:
-  name  : char 3-grams of the core name (typos, spacing, suffix noise)
+Per country and per source (S2, S3), TF-IDF blockers retrieve candidates for every Source 1 query:
+  name  : char n-grams (NAME_NGRAM) of the core name (typos, spacing, suffix noise)
   addr  : address tokens incl. house numbers (pairs whose names differ completely)
   combo : 50/50 blend of both (weak name + good address, or the reverse)
+  rev   : reverse name search. Every S2/S3 record searches ALL S1 of its country and keeps its
+          top REV_K. Each S2/S3 has at most one true S1, so this rescues typo names that sink
+          below many look-alikes in the forward search. Only pairs whose S1 is a query are kept.
 TF-IDF is fit on each split's own pool (unsupervised, no labels). Tokens present in more than
 MAX_DF of a country pool are dropped: they carry little signal and dominate compute.
 The union is ordered per (S1, source) by best rank across blockers -> column `pos`.
@@ -24,7 +26,8 @@ except ImportError:          # exact fallback: fine for small local samples only
     sp_matmul_topn = None
 
 KEYS = ["s1", "src", "id"]
-BLOCKERS = list(C.BLOCK_K)
+K = {**C.BLOCK_K, **({"rev": C.REV_K} if C.REV_K else {})}
+BLOCKERS = list(K)
 
 
 def query_mask(ids, qfrac):
@@ -42,7 +45,7 @@ def query_s1(split, frac, qfrac):
 def _tfidf(texts, kind):
     kw = dict(sublinear_tf=True, dtype=np.float32, max_df=max(int(C.MAX_DF * len(texts)), 2))
     if kind == "name":
-        v = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), **kw)
+        v = TfidfVectorizer(analyzer="char_wb", ngram_range=tuple(C.NAME_NGRAM), **kw)
     else:
         v = TfidfVectorizer(token_pattern=r"\S+", **kw)
     try:
@@ -67,7 +70,23 @@ def _topk(Q, PT, k):
     return r[keep], c[keep], v[keep], rank[keep].astype(np.int16)
 
 
-def _block_country(s1, qmask, pools):
+def _reverse(X, bounds, frames, qmask):
+    """Each S2/S3 record -> its top REV_K S1 (full S1 pool); keep pairs whose S1 is a query."""
+    PT = X[bounds[0]:bounds[1]].T.tocsr()
+    s1ids = frames[0]["id"].to_numpy()
+    parts = []
+    for j, s in ((1, 2), (2, 3)):
+        P = X[bounds[j]:bounds[j + 1]]
+        pids = frames[j]["id"].to_numpy()
+        for a in range(0, P.shape[0], C.Q_CHUNK):
+            r, c, v, k = _topk(P[a:a + C.Q_CHUNK], PT, C.REV_K)
+            m = qmask[c]
+            parts.append(pl.DataFrame({"s1": s1ids[c[m]], "src": np.full(int(m.sum()), s, np.int8),
+                                       "id": pids[a + r[m]], "r_rev": k[m], "s_rev": v[m]}))
+    return pl.concat(parts) if parts else None
+
+
+def _block_country(s1, qmask, pools, label):
     frames = [s1, pools[2], pools[3]]
     bounds = np.cumsum([0] + [f.height for f in frames])
     names = pl.concat([f["name_core"] for f in frames]).to_list()
@@ -79,7 +98,7 @@ def _block_country(s1, qmask, pools):
     qids = s1["id"].to_numpy()[qmask]
 
     res = None
-    for b in BLOCKERS:
+    for b in C.BLOCK_K:
         X = mats.get(b)
         if X is None or len(qids) == 0:
             continue
@@ -98,6 +117,12 @@ def _block_country(s1, qmask, pools):
             df = pl.concat(parts)
             res = df if res is None else res.join(df, on=KEYS, how="full", coalesce=True)
 
+    if C.REV_K and mats["name"] is not None and len(qids):
+        with D.step(f"  rev {label}: {int(bounds[-1] - bounds[1]):,} records -> {s1.height:,} S1"):
+            df = _reverse(mats["name"], bounds, frames, qmask)
+        if df is not None:
+            res = df if res is None else res.join(df, on=KEYS, how="full", coalesce=True)
+
     if res is None:
         res = pl.DataFrame(schema={"s1": pl.Int64, "src": pl.Int8, "id": pl.Int64})
     for b in BLOCKERS:
@@ -109,8 +134,8 @@ def _block_country(s1, qmask, pools):
 
 def block_split(split, frac=1.0, qfrac=1.0):
     """All candidates (uncapped) for the S1 queries of a split; cached as parquet."""
-    tag = (f"{split}_f{frac:g}_q{qfrac:g}_n{N.VERSION}"
-           f"_k{max(C.BLOCK_K.values())}_df{C.MAX_DF:g}")
+    tag = (f"{split}_f{frac:g}_q{qfrac:g}_n{N.VERSION}_k{max(C.BLOCK_K.values())}_df{C.MAX_DF:g}"
+           f"_ng{C.NAME_NGRAM[0]}{C.NAME_NGRAM[1]}_rev{C.REV_K}q")
     d = C.WORK_DIR / "cand"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{tag}.parquet"
@@ -126,11 +151,16 @@ def block_split(split, frac=1.0, qfrac=1.0):
             continue
         pools = {s: norm[s].filter(pl.col("cty") == cty) for s in (2, 3)}
         with D.step(f"block {tag} [{cty}] queries={int(qmask.sum()):,}"):
-            parts.append(_block_country(s1, qmask, pools))
+            parts.append(_block_country(s1, qmask, pools, cty))
 
-    rc = [f"r_{b}" for b in BLOCKERS]
+    cand = pl.concat(parts)
+    rc = [f"r_{b}" for b in C.BLOCK_K]
+    if C.REV_K:   # re-rank reverse hits per (S1, source) so hub S1s cannot flood the low positions
+        cand = cand.with_columns((pl.col("s_rev").rank("ordinal", descending=True).over(["s1", "src"]) - 1)
+                                 .cast(pl.Int16).alias("q_rev"))
+        rc.append("q_rev")
     sc = [f"s_{b}" for b in BLOCKERS]
-    cand = (pl.concat(parts)
+    cand = (cand
             .with_columns(pl.min_horizontal(rc).alias("min_rank"),
                           pl.max_horizontal(sc).alias("max_score"),
                           pl.sum_horizontal([pl.col(c).is_not_null() for c in rc]).cast(pl.Int8).alias("nb"))

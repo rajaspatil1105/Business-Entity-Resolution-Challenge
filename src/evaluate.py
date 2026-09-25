@@ -260,7 +260,7 @@ def block_report(frac=1.0, qfrac=1.0):
     _hdr("B1. RECALL PER BLOCKER (true pair within top-k of that blocker)")
     rows = []
     for b in B.BLOCKERS:
-        for k in [x for x in (1, 3, 5, 10, 20, 30, 50) if x <= C.BLOCK_K[b]]:
+        for k in [x for x in (1, 3, 5, 10, 20, 30, 50) if x <= B.K[b]]:
             ok = (pl.col(f"r_{b}") < k).fill_null(False)
             r = {"blocker": b, "k": k}
             for s in (2, 3):
@@ -297,7 +297,7 @@ def block_report(frac=1.0, qfrac=1.0):
     miss = h.filter(~pl.col("ok"))
     print(f"missed: {miss.height:,} | never retrieved by any blocker: {miss['pos'].null_count():,}")
     print(_sample(miss, 15).join(s1raw, on="s1").join(oth, on=["src", "id"])
-          .select("name1", "name", "addr1", "addr", "pos", "r_name", "r_addr", "r_combo"))
+          .select("name1", "name", "addr1", "addr", "pos", *[f"r_{b}" for b in B.BLOCKERS]))
 
     _hdr("B5. TOP COMBO SCORE PER S1: SINGLETON vs MATCHED (p5 p25 p50 p75 p95)")
     top = cand.group_by("s1").agg(pl.col("s_combo").max().alias("top"))
