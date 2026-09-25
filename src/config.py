@@ -25,3 +25,9 @@ N_THREADS = os.cpu_count() or 4
 
 NAME_NGRAM = (3, 3)   # char n-gram range of the name blocker
 REV_K = 5             # reverse name blocker: top S1 kept per S2/S3 record (0 = off)
+FEAT_CHUNK = 1_000_000   # candidate pairs per feature chunk (memory bound)
+N_FOLDS = 5              # GroupKFold by S1
+HOLDOUT_PCT = 15         # % of S1 groups locked for the final score
+LGB_SEED = 42
+LGB_ROUNDS = 2000
+LGB_EARLY_STOP = 50

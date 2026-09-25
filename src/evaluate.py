@@ -305,3 +305,88 @@ def block_report(frac=1.0, qfrac=1.0):
     for lab, g2 in (("singleton", e.filter(pl.col("t") == 0)), ("matched  ", e.filter(pl.col("t") > 0))):
         if g2.height:
             print(lab, np.percentile(g2["top"].to_numpy(), [5, 25, 50, 75, 95]).round(3))
+
+
+def feat_report(frac=1.0, qfrac=1.0):
+    from src import features as F
+    pl.Config.set_tbl_rows(80)
+    df = F.build("train", frac, qfrac)
+    y = df["label"].to_numpy()
+    cols = F.feature_cols(df)
+    print(f"pairs {df.height:,} | S1 {df['s1'].n_unique():,} | positives {int(y.sum()):,} "
+          f"({y.mean():.2%}) | features {len(cols)}")
+
+    _hdr("F1. SINGLE-FEATURE AUC (null -> -1; auc < 0.5 means lower = match)")
+    rows = []
+    for c in cols:
+        x = df[c].cast(pl.Float64).to_numpy()
+        nul = np.isnan(x)
+        xp, xn = x[(y == 1) & ~nul], x[(y == 0) & ~nul]
+        rows.append({"feature": c, "auc": round(float(_auc(y, np.where(nul, -1.0, x))), 4),
+                     "null": round(float(nul.mean()), 4),
+                     "mean_pos": round(float(xp.mean()), 3) if len(xp) else None,
+                     "mean_neg": round(float(xn.mean()), 3) if len(xn) else None})
+    print(pl.DataFrame(rows).with_columns((pl.col("auc") - 0.5).abs().alias("_d"))
+          .sort("_d", descending=True).drop("_d"))
+
+
+def _auc(y, x):
+    """Rank-based ROC AUC (ties averaged); avoids sklearn.metrics (blocked DLL on this laptop)."""
+    r = pl.Series(x).rank("average").to_numpy()
+    p = y == 1
+    n1, n0 = int(p.sum()), int((~p).sum())
+    return (r[p].sum() - n1 * (n1 + 1) / 2) / max(n1 * n0, 1)
+
+
+def stagea_report(frac=1.0, qfrac=1.0):
+    import json
+    from src import blocking as B
+    from src import decide as K
+    from src import model as M
+    pl.Config.set_tbl_rows(30)
+    P = M.stage_a(frac, qfrac)
+    q = B.query_s1("train", frac, qfrac)
+    gt = D.load_split("train", frac)["pairs"].join(q, on="s1")
+    base = (q.join(gt.group_by("s1").agg(pl.len().alias("t")), on="s1", how="left")
+            .with_columns(pl.col("t").fill_null(0)))
+    base = base.with_columns(pl.Series("fold", M.fold_of(base["s1"].to_numpy())))
+    dev = P.filter(pl.col("fold") >= 0)
+    bdev = base.filter(pl.col("fold") >= 0).select("s1", "cty", "t")
+    print(f"dev S1 {bdev.height:,} | dev pairs {dev.height:,} | holdout S1 {base.height - bdev.height:,} (locked)")
+    if qfrac < 1:
+        print("note: qfrac < 1 -> most competing S1s are not queried, one-to-one is under-measured")
+
+    _hdr("A1. OOF PAIR AUC + FEATURE GAIN (sum over folds)")
+    print("oof auc", round(float(_auc(dev["label"].to_numpy(), dev["p"].to_numpy())), 5))
+    print(M.importance(frac, qfrac))
+
+    _hdr("A2. DECISION GRID ON DEV OOF (macro F0.5; pick = best plateau)")
+    best = None
+    for mode in ("none", "hard"):
+        g = K.grid(dev, bdev, mode)
+        print(f"one_to_one = {mode}")
+        print(g.head(5))
+        r = g.row(0, named=True)
+        if best is None or r["plateau"] > best["plateau"]:
+            best = {**r, "mode": mode}
+    print("chosen:", best)
+    (C.WORK_DIR / "model" / f"decision_{M.tag(frac, qfrac)}.json").write_text(json.dumps(best))
+
+    _hdr("A3. ORACLE: BLOCKING CEILING -> RANKING ORACLE -> ACTUAL")
+    lab = dev.group_by("s1").agg(pl.col("label").cast(pl.Int32).sum().alias("m"))
+    e = bdev.join(lab, on="s1", how="left").with_columns(pl.col("m").fill_null(0))
+    ceil = float(K.f05(e["t"], e["m"], e["m"]).mean())
+    top = (dev.join(bdev.select("s1", "t"), on="s1")
+           .filter(pl.col("p").rank("ordinal", descending=True).over("s1") <= pl.col("t")))
+    orc = float(K.per_s1(top, bdev)["f"].mean())
+    a = K.per_s1(K.decide(dev, best["mode"], best["t_single"], best["t_abs"], best["t_rel"]), bdev)
+    tp, n, t = a["tp"].sum(), a["n"].sum(), a["t"].sum()
+    print(f"ceiling {ceil:.4f} | ranking oracle {orc:.4f} | actual {a['f'].mean():.4f}")
+    print(f"pair precision {tp / max(n, 1):.4f} | pair recall {tp / max(t, 1):.4f}")
+
+    _hdr("A4. ACTUAL F0.5 BY COUNTRY / TRUE MATCH COUNT (8 = 8+)")
+    print(a.group_by("cty").agg(pl.col("f").mean().round(4), pl.len().alias("s1s")).sort("cty"))
+    print(a.with_columns((pl.col("n") - pl.col("tp")).alias("fp"), (pl.col("t") - pl.col("tp")).alias("fn"),
+                         pl.col("t").clip(0, 8).alias("tb"))
+          .group_by("tb").agg(pl.col("f").mean().round(4), pl.len().alias("s1s"),
+                              pl.col("fp").sum(), pl.col("fn").sum()).sort("tb"))
