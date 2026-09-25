@@ -4,13 +4,18 @@ Per country and per source (S2, S3), TF-IDF blockers retrieve candidates for eve
   name  : char n-grams (NAME_NGRAM) of the core name (typos, spacing, suffix noise)
   addr  : address tokens incl. house numbers (pairs whose names differ completely)
   combo : 50/50 blend of both (weak name + good address, or the reverse)
-  rev   : reverse name search. Every S2/S3 record searches ALL S1 of its country and keeps its
-          top REV_K. Each S2/S3 has at most one true S1, so this rescues typo names that sink
-          below many look-alikes in the forward search. Only pairs whose S1 is a query are kept.
+  rev   : reverse name search. Every S2/S3 record searches all S1 of its country and keeps its
+          top REV_K (each S2/S3 has at most one true S1). Only pairs whose S1 is a query are kept.
+Speed (STATE_BUCKETS): TF-IDF is fit once per country (scores stay comparable), but a query only
+searches records that share a state with it or have no state; a query without a state searches
+the whole country. True pairs share the state whenever both records have one (norm report), so
+missing states never drop a pair. Per-bucket top-k lists are merged and re-ranked.
 TF-IDF is fit on each split's own pool (unsupervised, no labels). Tokens present in more than
-MAX_DF of a country pool are dropped: they carry little signal and dominate compute.
-The union is ordered per (S1, source) by best rank across blockers -> column `pos`.
+MAX_DF of a country pool are dropped. Each (country, blocker) result is checkpointed, so a rerun
+after a crash resumes. The union is ordered per (S1, source) by best rank -> column `pos`.
 """
+import shutil
+
 import numpy as np
 import polars as pl
 import scipy.sparse as sp
@@ -28,6 +33,7 @@ except ImportError:          # exact fallback: fine for small local samples only
 KEYS = ["s1", "src", "id"]
 K = {**C.BLOCK_K, **({"rev": C.REV_K} if C.REV_K else {})}
 BLOCKERS = list(K)
+EMPTY = np.empty(0, np.int64)
 
 
 def query_mask(ids, qfrac):
@@ -54,6 +60,16 @@ def _tfidf(texts, kind):
         return None
 
 
+def _mats(frames):
+    names = pl.concat([f["name_core"] for f in frames]).to_list()
+    addrs = pl.concat([f["addr_norm"] for f in frames]).to_list()
+    m = {"name": _tfidf(names, "name"), "addr": _tfidf(addrs, "addr")}
+    if m["name"] is not None and m["addr"] is not None:
+        h = np.float32(np.sqrt(0.5))
+        m["combo"] = sp.hstack([m["name"] * h, m["addr"] * h], format="csr", dtype=np.float32)
+    return m
+
+
 def _topk(Q, PT, k):
     """Top-k columns per row of Q @ PT -> (row, col, score, rank)."""
     if sp_matmul_topn is not None:
@@ -70,57 +86,99 @@ def _topk(Q, PT, k):
     return r[keep], c[keep], v[keep], rank[keep].astype(np.int16)
 
 
-def _reverse(X, bounds, frames, qmask):
-    """Each S2/S3 record -> its top REV_K S1 (full S1 pool); keep pairs whose S1 is a query."""
-    PT = X[bounds[0]:bounds[1]].T.tocsr()
-    s1ids = frames[0]["id"].to_numpy()
-    parts = []
-    for j, s in ((1, 2), (2, 3)):
-        P = X[bounds[j]:bounds[j + 1]]
-        pids = frames[j]["id"].to_numpy()
-        for a in range(0, P.shape[0], C.Q_CHUNK):
-            r, c, v, k = _topk(P[a:a + C.Q_CHUNK], PT, C.REV_K)
-            m = qmask[c]
-            parts.append(pl.DataFrame({"s1": s1ids[c[m]], "src": np.full(int(m.sum()), s, np.int8),
-                                       "id": pids[a + r[m]], "r_rev": k[m], "s_rev": v[m]}))
-    return pl.concat(parts) if parts else None
+def _states(df):
+    """addr_state as a list of state codes per row (empty list = no state)."""
+    c = df["addr_state"]
+    s = (c.cast(pl.List(pl.Utf8)) if isinstance(c.dtype, pl.List)
+         else c.cast(pl.Utf8).fill_null("").str.split(" "))
+    return s.list.eval(pl.element().filter(pl.element().is_not_null() & (pl.element() != "")))
 
 
-def _block_country(s1, qmask, pools, label):
+def _members(states):
+    """state -> sorted row indices, plus rows without a state. Buckets off: all rows 'no state'."""
+    n = len(states)
+    if not C.STATE_BUCKETS:
+        return {}, np.arange(n)
+    d = pl.DataFrame({"row": np.arange(n), "st": states}).explode("st")
+    none = np.unique(d.filter(pl.col("st").is_null())["row"].to_numpy())
+    groups = {}
+    for key, g in d.filter(pl.col("st").is_not_null()).group_by("st"):
+        groups[key[0] if isinstance(key, tuple) else key] = np.unique(g["row"].to_numpy())
+    return groups, none
+
+
+def _search(Xq, qst, Xp, pst, k):
+    """Top-k pool rows per query row -> (q, p, score, rank). A query searches pool rows of its own
+    state(s) plus pool rows without a state; a query without a state searches the whole pool."""
+    qg, qn = _members(qst)
+    pg, pn = _members(pst)
+    jobs = [(qi, np.union1d(pg.get(s, EMPTY), pn)) for s, qi in qg.items()]
+    if len(qn):
+        jobs.append((qn, np.arange(Xp.shape[0])))
+    R, P, V = [], [], []
+    for qi, pi in jobs:
+        if len(qi) == 0 or len(pi) == 0:
+            continue
+        PT = Xp[pi].T.tocsr()
+        Q = Xq[qi]
+        for a in range(0, len(qi), C.Q_CHUNK):
+            r, c, v, _ = _topk(Q[a:a + C.Q_CHUNK], PT, k)
+            R.append(qi[a + r])
+            P.append(pi[c])
+            V.append(v)
+    if not R:
+        return EMPTY, EMPTY, np.empty(0, np.float32), np.empty(0, np.int16)
+    df = (pl.DataFrame({"q": np.concatenate(R), "p": np.concatenate(P), "v": np.concatenate(V)})
+          .group_by("q", "p").agg(pl.col("v").max())
+          .with_columns(pl.col("v").rank("ordinal", descending=True).over("q").alias("k"))
+          .filter(pl.col("k") <= k))
+    return (df["q"].to_numpy(), df["p"].to_numpy(), df["v"].to_numpy().astype(np.float32),
+            (df["k"].to_numpy() - 1).astype(np.int16))
+
+
+def _block_country(s1, qmask, pools, cty, pdir):
     frames = [s1, pools[2], pools[3]]
     bounds = np.cumsum([0] + [f.height for f in frames])
-    names = pl.concat([f["name_core"] for f in frames]).to_list()
-    addrs = pl.concat([f["addr_norm"] for f in frames]).to_list()
-    mats = {"name": _tfidf(names, "name"), "addr": _tfidf(addrs, "addr")}
-    if mats["name"] is not None and mats["addr"] is not None:
-        h = np.float32(np.sqrt(0.5))
-        mats["combo"] = sp.hstack([mats["name"] * h, mats["addr"] * h], format="csr", dtype=np.float32)
-    qids = s1["id"].to_numpy()[qmask]
+    sts = [_states(f) for f in frames]
+    ns = [float((s.list.len().fill_null(0) == 0).mean() or 0) for s in sts]
+    print(f"  [{cty}] no-state share  S1 {ns[0]:.1%} | S2 {ns[1]:.1%} | S3 {ns[2]:.1%} | "
+          f"state buckets {'on' if C.STATE_BUCKETS else 'off'}")
+    qidx = np.flatnonzero(qmask)
+    s1ids = s1["id"].to_numpy()
+    mats = {}
 
     res = None
-    for b in C.BLOCK_K:
-        X = mats.get(b)
-        if X is None or len(qids) == 0:
-            continue
-        Q = X[bounds[0]:bounds[1]][qmask]
-        parts = []
-        for j, s in ((1, 2), (2, 3)):
-            if bounds[j + 1] == bounds[j]:
-                continue
-            PT = X[bounds[j]:bounds[j + 1]].T.tocsr()
-            pids = frames[j]["id"].to_numpy()
-            for a in range(0, Q.shape[0], C.Q_CHUNK):
-                r, c, v, k = _topk(Q[a:a + C.Q_CHUNK], PT, C.BLOCK_K[b])
-                parts.append(pl.DataFrame({"s1": qids[a + r], "src": np.full(len(r), s, np.int8),
-                                           "id": pids[c], f"r_{b}": k, f"s_{b}": v}))
-        if parts:
-            df = pl.concat(parts)
-            res = df if res is None else res.join(df, on=KEYS, how="full", coalesce=True)
-
-    if C.REV_K and mats["name"] is not None and len(qids):
-        with D.step(f"  rev {label}: {int(bounds[-1] - bounds[1]):,} records -> {s1.height:,} S1"):
-            df = _reverse(mats["name"], bounds, frames, qmask)
-        if df is not None:
+    for b in BLOCKERS:
+        cp = pdir / f"{cty}_{b}.parquet"
+        if cp.exists():
+            df = pl.read_parquet(cp)
+        else:
+            if not mats:
+                with D.step(f"  tfidf [{cty}]"):
+                    mats.update(_mats(frames))
+            X = mats.get("name" if b == "rev" else b)
+            parts = []
+            if X is not None and len(qidx):
+                with D.step(f"  {b} [{cty}]"):
+                    S1X = X[bounds[0]:bounds[1]]
+                    for j, s in ((1, 2), (2, 3)):
+                        if bounds[j + 1] == bounds[j]:
+                            continue
+                        PX = X[bounds[j]:bounds[j + 1]]
+                        pids = frames[j]["id"].to_numpy()
+                        if b == "rev":
+                            q, p, v, k = _search(PX, sts[j], S1X, sts[0], C.REV_K)
+                            m = qmask[p]
+                            parts.append(pl.DataFrame({"s1": s1ids[p[m]], "src": np.full(int(m.sum()), s, np.int8),
+                                                       "id": pids[q[m]], "r_rev": k[m], "s_rev": v[m]}))
+                        else:
+                            q, p, v, k = _search(S1X[qidx], sts[0].gather(qidx), PX, sts[j], K[b])
+                            parts.append(pl.DataFrame({"s1": s1ids[qidx[q]], "src": np.full(len(q), s, np.int8),
+                                                       "id": pids[p], f"r_{b}": k, f"s_{b}": v}))
+            df = pl.concat(parts) if parts else pl.DataFrame(
+                schema={"s1": pl.Int64, "src": pl.Int8, "id": pl.Int64, f"r_{b}": pl.Int16, f"s_{b}": pl.Float32})
+            df.write_parquet(cp)
+        if df.height:
             res = df if res is None else res.join(df, on=KEYS, how="full", coalesce=True)
 
     if res is None:
@@ -132,15 +190,21 @@ def _block_country(s1, qmask, pools, label):
     return res.select(KEYS + [x for b in BLOCKERS for x in (f"r_{b}", f"s_{b}")])
 
 
+def tag(split, frac, qfrac):
+    return (f"{split}_f{frac:g}_q{qfrac:g}_n{N.VERSION}_k{max(C.BLOCK_K.values())}_df{C.MAX_DF:g}"
+            f"_ng{C.NAME_NGRAM[0]}{C.NAME_NGRAM[1]}_rev{C.REV_K}q_sb{int(C.STATE_BUCKETS)}")
+
+
 def block_split(split, frac=1.0, qfrac=1.0):
     """All candidates (uncapped) for the S1 queries of a split; cached as parquet."""
-    tag = (f"{split}_f{frac:g}_q{qfrac:g}_n{N.VERSION}_k{max(C.BLOCK_K.values())}_df{C.MAX_DF:g}"
-           f"_ng{C.NAME_NGRAM[0]}{C.NAME_NGRAM[1]}_rev{C.REV_K}q")
+    t = tag(split, frac, qfrac)
     d = C.WORK_DIR / "cand"
     d.mkdir(parents=True, exist_ok=True)
-    f = d / f"{tag}.parquet"
+    f = d / f"{t}.parquet"
     if f.exists():
         return pl.read_parquet(f)
+    pdir = d / f"{t}_parts"
+    pdir.mkdir(exist_ok=True)
 
     norm = N.normalize_split(split, frac)
     parts = []
@@ -150,8 +214,8 @@ def block_split(split, frac=1.0, qfrac=1.0):
         if not qmask.any():
             continue
         pools = {s: norm[s].filter(pl.col("cty") == cty) for s in (2, 3)}
-        with D.step(f"block {tag} [{cty}] queries={int(qmask.sum()):,}"):
-            parts.append(_block_country(s1, qmask, pools, cty))
+        with D.step(f"block {t} [{cty}] queries={int(qmask.sum()):,}"):
+            parts.append(_block_country(s1, qmask, pools, cty, pdir))
 
     cand = pl.concat(parts)
     rc = [f"r_{b}" for b in C.BLOCK_K]
@@ -167,4 +231,5 @@ def block_split(split, frac=1.0, qfrac=1.0):
             .sort(["s1", "src", "min_rank", "max_score"], descending=[False, False, False, True])
             .with_columns(pl.int_range(pl.len()).over(["s1", "src"]).cast(pl.Int16).alias("pos")))
     cand.write_parquet(f)
+    shutil.rmtree(pdir, ignore_errors=True)
     return cand

@@ -31,3 +31,4 @@ HOLDOUT_PCT = 15         # % of S1 groups locked for the final score
 LGB_SEED = 42
 LGB_ROUNDS = 2000
 LGB_EARLY_STOP = 50
+STATE_BUCKETS = True     # search same-state + no-state records only; no-state queries search the whole country

@@ -31,7 +31,7 @@ def params():
 
 def tag(frac, qfrac):
     return (f"f{frac:g}_q{qfrac:g}_cap{C.BLOCK_CAP}_n{N.VERSION}_df{C.MAX_DF:g}"
-            f"_ng{C.NAME_NGRAM[0]}{C.NAME_NGRAM[1]}_rev{C.REV_K}_v{F.VERSION}")
+            f"_ng{C.NAME_NGRAM[0]}{C.NAME_NGRAM[1]}_rev{C.REV_K}_sb{int(C.STATE_BUCKETS)}_v{F.VERSION}")
 
 
 def matrix(df, cols):
