@@ -1,0 +1,7 @@
+artifacts/
+output/
+dataset/
+.venv/
+__pycache__/
+*.parquet
+*.zip

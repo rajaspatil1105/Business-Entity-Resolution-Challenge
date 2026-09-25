@@ -1,0 +1,8 @@
+polars>=1.0
+pyarrow
+numpy
+pandas
+scikit-learn
+lightgbm>=4.0
+rapidfuzz>=3.6
+psutil
