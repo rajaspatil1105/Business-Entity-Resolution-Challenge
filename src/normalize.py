@@ -16,7 +16,7 @@ from indic_transliteration.sanscript import transliterate
 from src import config as C
 from src import data as D
 
-VERSION = 3          # bump when rules change -> old cache is ignored
+VERSION = 4          # bump when rules change -> old cache is ignored
 CHUNK = 1_000_000
 
 NONLATIN = r"[^\x00-\x7f]"                 # after accent stripping: anything non-ASCII
@@ -31,6 +31,8 @@ LANDMARK = r"\b(near|nr|opp|opposite|behind|beside|besides|next to|pres de|en fa
 ALIAS_RE = r"^(.*?)\s+(?:dba|d b a|aka|a k a|fka|f k a|trading as|formerly)\s+(.+)$"
 DOMAIN = r"\.(com|net|org|biz|info|co\.in|in|fr|us|io)\s*$"
 
+PVT_RE = r"\b[pb]h?i?ra?i?[vb]h?e[td]h?\b"   # transliterated 'private' spellings
+LTD_RE = r"\blimi[td]h?e?[td]h?\b"           # transliterated 'limited' spellings
 INDIC = [("\u0900", "\u097f", sanscript.DEVANAGARI), ("\u0980", "\u09ff", sanscript.BENGALI),
          ("\u0a00", "\u0a7f", sanscript.GURMUKHI), ("\u0a80", "\u0aff", sanscript.GUJARATI),
          ("\u0b00", "\u0b7f", sanscript.ORIYA), ("\u0b80", "\u0bff", sanscript.TAMIL),
@@ -220,6 +222,10 @@ def _normalize_country(df, cty):
             pl.element().str.replace_all(PUNCT, " ").str.replace_all(r"\s+", " ").str.strip_chars()
         ).alias("_segs"),
     )
+    df = df.with_columns(
+        pl.when(pl.col("name_nonlatin"))
+          .then(pl.col("_n").str.replace_all(PVT_RE, "pvt").str.replace_all(LTD_RE, "ltd"))
+          .otherwise(pl.col("_n")).alias("_n"))
     if smap:
         df = df.with_columns(pl.col("_segs").list.eval(pl.element().replace(smap)))
 

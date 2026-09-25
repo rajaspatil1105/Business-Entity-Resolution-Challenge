@@ -7,3 +7,4 @@ lightgbm>=4.0
 rapidfuzz>=3.6
 psutil
 indic-transliteration
+sparse_dot_topn

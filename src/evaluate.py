@@ -228,3 +228,80 @@ def norm_report(frac=1.0):
           f"{(low & (asim >= 80)).sum() / max(low.sum(), 1):.1%}")
     print(j.with_columns(pl.Series("ns", ns)).filter(pl.col("ns") < 50).head(12)
           .select("name_1", "name", "addr_1", "addr"))
+
+
+# ============================================================ Step 2 report
+def _f05(t, m):
+    t = np.asarray(t, float)
+    m = np.asarray(m, float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f = 1.25 * m / (0.25 * t + m)
+    return np.where(t == 0, 1.0, np.where(m == 0, 0.0, f))
+
+
+def block_report(frac=1.0, qfrac=1.0):
+    from src import blocking as B
+    pl.Config.set_tbl_rows(40)
+    pl.Config.set_tbl_cols(20)
+    pl.Config.set_fmt_str_lengths(70)
+    pl.Config.set_tbl_width_chars(220)
+
+    cand = B.block_split("train", frac, qfrac)
+    tr = D.load_split("train", frac)
+    q = B.query_s1("train", frac, qfrac)
+    gt = tr["pairs"].join(q, on="s1")
+    hit = gt.join(cand, on=B.KEYS, how="left")
+    t = gt.group_by("s1").agg(pl.len().alias("t"))
+    base = q.select("s1").join(t, on="s1", how="left").fill_null(0)
+    kmax = max(C.BLOCK_K.values())
+    print(f"queries {q.height:,} | true pairs {gt.height:,} | candidates {cand.height:,} | "
+          f"singletons {(base['t'] == 0).mean():.2%}")
+
+    _hdr("B1. RECALL PER BLOCKER (true pair within top-k of that blocker)")
+    rows = []
+    for b in B.BLOCKERS:
+        for k in [x for x in (1, 3, 5, 10, 20, 30, 50) if x <= C.BLOCK_K[b]]:
+            ok = (pl.col(f"r_{b}") < k).fill_null(False)
+            r = {"blocker": b, "k": k}
+            for s in (2, 3):
+                r[f"S{s}"] = round(hit.filter(pl.col("src") == s).select(ok.mean()).item(), 4)
+            rows.append(r)
+    print(pl.DataFrame(rows))
+
+    _hdr("B2. UNION vs CAP (cap = candidates kept per S1 per source)")
+    rows = []
+    for cap in [x for x in (3, 5, 8, 10, 15, 20, 30, 40, 60) if x <= 3 * kmax]:
+        m = hit.filter(pl.col("pos") < cap).group_by("s1").agg(pl.len().alias("m"))
+        e = base.join(m, on="s1", how="left").fill_null(0)
+        n = q.select("s1").join(cand.filter(pl.col("pos") < cap).group_by("s1").agg(pl.len().alias("n")),
+                                on="s1", how="left").fill_null(0)["n"]
+        rows.append({"cap": cap, "recall": round(e["m"].sum() / max(gt.height, 1), 4),
+                     "ceiling_f05": round(float(_f05(e["t"], e["m"]).mean()), 4),
+                     "cand_mean": round(n.mean(), 1), "cand_p95": n.quantile(0.95)})
+    print(pl.DataFrame(rows))
+
+    cap = C.BLOCK_CAP
+    _hdr(f"B3. AT BLOCK_CAP={cap}: BY COUNTRY+SOURCE / BY TRUE MATCH COUNT")
+    h = hit.with_columns((pl.col("pos") < cap).fill_null(False).alias("ok"))
+    print(h.group_by("cty", "src").agg(pl.col("ok").mean().round(4).alias("recall"),
+                                       pl.len().alias("pairs")).sort("cty", "src"))
+    g = h.group_by("s1").agg(pl.len().alias("t"), pl.col("ok").sum().alias("m"))
+    g = g.with_columns(pl.Series("f", _f05(g["t"], g["m"])))
+    print(g.group_by("t").agg(pl.col("f").mean().round(4).alias("ceiling"),
+                              pl.len().alias("s1s")).sort("t"))
+
+    _hdr("B4. MISSED TRUE PAIRS (sample)")
+    s1raw = tr["src"][1].select(pl.col("id").alias("s1"), pl.col("name").alias("name1"),
+                                pl.col("addr").alias("addr1"))
+    oth = pl.concat([tr["src"][2], tr["src"][3]]).select("src", "id", "name", "addr")
+    miss = h.filter(~pl.col("ok"))
+    print(f"missed: {miss.height:,} | never retrieved by any blocker: {miss['pos'].null_count():,}")
+    print(_sample(miss, 15).join(s1raw, on="s1").join(oth, on=["src", "id"])
+          .select("name1", "name", "addr1", "addr", "pos", "r_name", "r_addr", "r_combo"))
+
+    _hdr("B5. TOP COMBO SCORE PER S1: SINGLETON vs MATCHED (p5 p25 p50 p75 p95)")
+    top = cand.group_by("s1").agg(pl.col("s_combo").max().alias("top"))
+    e = base.join(top, on="s1", how="left").with_columns(pl.col("top").fill_null(0.0))
+    for lab, g2 in (("singleton", e.filter(pl.col("t") == 0)), ("matched  ", e.filter(pl.col("t") > 0))):
+        if g2.height:
+            print(lab, np.percentile(g2["top"].to_numpy(), [5, 25, 50, 75, 95]).round(3))
