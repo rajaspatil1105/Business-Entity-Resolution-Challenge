@@ -5,3 +5,5 @@ dataset/
 __pycache__/
 *.parquet
 *.zip
+
+output/
