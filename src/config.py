@@ -18,7 +18,7 @@ def source_path(split, s):
 # ---- Step 2: blocking
 BLOCK_K = {"name": 30, "addr": 30, "combo": 30}   # top-k per blocker, per source
 BLOCK_CAP = 30        # candidates kept per S1 per source after the union
-MAX_DF = 0.02         # drop tokens/3-grams present in more than this share of a country pool
+MAX_DF = 0.2         # drop tokens/3-grams present in more than this share of a country pool
 MIN_SIM = 0.05        # ignore retrieval scores below this
 Q_CHUNK = 100_000     # S1 queries per matrix product
 N_THREADS = os.cpu_count() or 4
