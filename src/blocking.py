@@ -195,29 +195,8 @@ def tag(split, frac, qfrac):
             f"_ng{C.NAME_NGRAM[0]}{C.NAME_NGRAM[1]}_rev{C.REV_K}q_sb{int(C.STATE_BUCKETS)}")
 
 
-def block_split(split, frac=1.0, qfrac=1.0):
-    """All candidates (uncapped) for the S1 queries of a split; cached as parquet."""
-    t = tag(split, frac, qfrac)
-    d = C.WORK_DIR / "cand"
-    d.mkdir(parents=True, exist_ok=True)
-    f = d / f"{t}.parquet"
-    if f.exists():
-        return pl.read_parquet(f)
-    pdir = d / f"{t}_parts"
-    pdir.mkdir(exist_ok=True)
-
-    norm = N.normalize_split(split, frac)
-    parts = []
-    for cty in sorted(norm[1]["cty"].unique().to_list()):
-        s1 = norm[1].filter(pl.col("cty") == cty)
-        qmask = query_mask(s1["id"].to_numpy(), qfrac)
-        if not qmask.any():
-            continue
-        pools = {s: norm[s].filter(pl.col("cty") == cty) for s in (2, 3)}
-        with D.step(f"block {t} [{cty}] queries={int(qmask.sum()):,}"):
-            parts.append(_block_country(s1, qmask, pools, cty, pdir))
-
-    cand = pl.concat(parts)
+def _rank(cand, cap=None):
+    """Order candidates per (S1, source) by best rank -> `pos`; optional cap keeps pos < cap."""
     rc = [f"r_{b}" for b in C.BLOCK_K]
     if C.REV_K:   # re-rank reverse hits per (S1, source) so hub S1s cannot flood the low positions
         cand = cand.with_columns((pl.col("s_rev").rank("ordinal", descending=True).over(["s1", "src"]) - 1)
@@ -230,6 +209,46 @@ def block_split(split, frac=1.0, qfrac=1.0):
                           pl.sum_horizontal([pl.col(c).is_not_null() for c in rc]).cast(pl.Int8).alias("nb"))
             .sort(["s1", "src", "min_rank", "max_score"], descending=[False, False, False, True])
             .with_columns(pl.int_range(pl.len()).over(["s1", "src"]).cast(pl.Int16).alias("pos")))
+    return cand.filter(pl.col("pos") < cap) if cap else cand
+
+
+def block_split(split, frac=1.0, qfrac=1.0):
+    """Candidates for the S1 queries of a split; cached as parquet.
+    Train: uncapped (report needs the cap table). Test: capped at BLOCK_CAP per country before concat.
+    Ranking is per (S1, source) and each S1 has one country, so this equals capping at the end."""
+    import gc
+    base = tag(split, frac, qfrac)
+    cap = C.BLOCK_CAP if (split == "test" and C.CAP_TEST) else None
+    t = base + (f"_cap{cap}" if cap else "")
+    d = C.WORK_DIR / "cand"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{t}.parquet"
+    if f.exists():
+        return pl.read_parquet(f)
+    pdir = d / f"{base}_parts"      # per-blocker checkpoints shared by capped/uncapped runs
+    pdir.mkdir(exist_ok=True)
+
+    norm = N.normalize_split(split, frac)
+    parts = []
+    for cty in sorted(norm[1]["cty"].unique().to_list()):
+        cf = pdir / (f"{cty}_final" + (f"_cap{cap}" if cap else "") + ".parquet")
+        if cf.exists():                      # country already finished -> resume
+            parts.append(pl.read_parquet(cf))
+            continue
+        s1 = norm[1].filter(pl.col("cty") == cty)
+        qmask = query_mask(s1["id"].to_numpy(), qfrac)
+        if not qmask.any():
+            continue
+        pools = {s: norm[s].filter(pl.col("cty") == cty) for s in (2, 3)}
+        with D.step(f"block {t} [{cty}] queries={int(qmask.sum()):,}"):
+            res = _rank(_block_country(s1, qmask, pools, cty, pdir), cap)
+            res.write_parquet(cf)
+        parts.append(res)
+        del s1, pools, res
+        gc.collect()
+
+    cand = pl.concat(parts)
     cand.write_parquet(f)
+    return cand
     shutil.rmtree(pdir, ignore_errors=True)
     return cand

@@ -109,3 +109,62 @@ def build():
 
 if __name__ == "__main__" and sys.argv[1:] == ["learn"]:
     build()
+
+
+# ---------- Fix 2b: city -> state (learned from S1 "..., City, State") ----------
+def _strip_acc(s):
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+
+def city_path():
+    from src import config as C
+    return C.WORK_DIR / "city_map.json"
+
+
+def build_cities(min_count=20, min_purity=0.95, min_state=1000):
+    from src import config as C
+    frames = []
+    for sp in ("train", "test"):
+        lf = pl.scan_csv(C.DATA_DIR / sp / f"{sp}_source1.tsv", separator="\t", quote_char=None, infer_schema=False)
+        ac = next(c for c in lf.collect_schema().names() if "addr" in c.lower())
+        frames.append(lf.select(pl.col(ac).alias("a")))
+    p = (pl.concat(frames).collect()
+         .with_columns(pl.col("a").str.split(",").list.eval(pl.element().str.strip_chars()).alias("p"))
+         .filter(pl.col("p").list.len() >= 2)
+         .select(pl.col("p").list.get(-2).str.to_lowercase().alias("city"),
+                 pl.col("p").list.get(-1).alias("state")))
+    good = p["state"].value_counts().filter(pl.col("count") >= min_state)["state"].to_list()
+    p = p.filter(pl.col("state").is_in(good) & (pl.col("city").str.len_chars() >= 3)
+                 & ~pl.col("city").str.contains(r"\d"))
+    agg = (p.group_by("city", "state").len()
+           .with_columns(pl.col("len").sum().over("city").alias("tot"))
+           .with_columns((pl.col("len") / pl.col("tot")).alias("pur"))
+           .filter((pl.col("pur") >= min_purity) & (pl.col("tot") >= min_count)))
+    cmap = {}
+    for c, s in zip(agg["city"], agg["state"]):
+        cmap[c] = s
+        cmap.setdefault(_strip_acc(c), s)
+    city_path().write_text(json.dumps(cmap, ensure_ascii=False), encoding="utf-8")
+    print(f"states kept {len(good)} | city map size {len(cmap):,} -> {city_path()}")
+    print([(k, v) for k, v in cmap.items() if k in ("bordeaux", "pessac", "lille", "nantes", "merignac", "calais")])
+
+
+def fix_cities(df, col="addr"):
+    """If an address comma-part is a known city, append its state (gazetteer then finds it)."""
+    p = city_path()
+    if not p.exists():
+        return df
+    cmap = json.loads(p.read_text(encoding="utf-8"))
+    hit = (df.select(pl.col(col)).with_row_index("_r")
+           .with_columns(pl.col(col).str.split(",").alias("_p")).explode("_p")
+           .with_columns(pl.col("_p").str.strip_chars().str.to_lowercase()
+                         .replace_strict(cmap, default=None, return_dtype=pl.String).alias("_st"))
+           .filter(pl.col("_st").is_not_null()).group_by("_r").agg(pl.col("_st").first()))
+    df = df.with_row_index("_r").join(hit, on="_r", how="left")
+    return df.with_columns(pl.when(pl.col("_st").is_not_null())
+                           .then(pl.col(col) + ", " + pl.col("_st")).otherwise(pl.col(col)).alias(col)
+                           ).drop("_r", "_st")
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["cities"]:
+    build_cities()

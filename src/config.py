@@ -32,3 +32,5 @@ LGB_SEED = 42
 LGB_ROUNDS = 2000
 LGB_EARLY_STOP = 50
 STATE_BUCKETS = True     # search same-state + no-state records only; no-state queries search the whole country
+
+CAP_TEST = True          # test candidates capped at BLOCK_CAP per country before saving (memory)
