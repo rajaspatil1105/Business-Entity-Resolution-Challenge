@@ -6,3 +6,4 @@ scikit-learn
 lightgbm>=4.0
 rapidfuzz>=3.6
 psutil
+indic-transliteration

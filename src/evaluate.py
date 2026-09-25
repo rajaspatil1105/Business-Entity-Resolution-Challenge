@@ -187,7 +187,7 @@ def norm_report(frac=1.0):
 
     _hdr("N4. TRUE PAIRS: RAW vs NORMALIZED (train)")
     tr, nt = raw["train"], norm["train"]
-    ncols = ["name_core", "addr_norm", "addr_state", "addr_nums", "addr_empty", "name_nonlatin", "is_handle"]
+    ncols = ["name_sq", "name_core", "addr_norm", "addr_state", "addr_nums", "addr_empty", "name_nonlatin", "is_handle"]
 
     def full(s):
         return nt[s].join(tr["src"][s].select("src", "id", "name", "addr"), on=["src", "id"])
@@ -202,11 +202,14 @@ def norm_report(frac=1.0):
 
     print("percentiles:   p1    p5    p10   p25   p50")
     res = {}
-    for label, a, b in (("name raw ", "name_1", "name"), ("name core", "name_core_1", "name_core"),
+    for label, a, b in (("name raw ", "name_1", "name"), ("name core", "name_core_1", "name_core"), ("name sq  ", "name_sq_1", "name_sq"),
                         ("addr raw ", "addr_1", "addr"), ("addr norm", "addr_norm_1", "addr_norm")):
         res[label] = sim(a, b)
         print(label, np.percentile(res[label], [1, 5, 10, 25, 50]).round(1))
 
+    nl = j["name_nonlatin"].to_numpy()
+    if nl.any():
+        print("name core, native-script S2/S3 only:", np.percentile(res["name core"][nl], [5, 25, 50]).round(1), f"(n={nl.sum()})")
     b = j.filter((pl.col("addr_nums_1").list.len() > 0) & (pl.col("addr_nums").list.len() > 0))
     sh = b.select((pl.col("addr_nums_1").list.set_intersection(pl.col("addr_nums")).list.len() > 0)
                   .cast(pl.Float64).mean()).item()
