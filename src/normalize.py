@@ -16,7 +16,7 @@ from indic_transliteration.sanscript import transliterate
 from src import config as C
 from src import data as D
 
-VERSION = 4          # bump when rules change -> old cache is ignored
+VERSION = 5          # bump when rules change -> old cache is ignored
 CHUNK = 1_000_000
 
 NONLATIN = r"[^\x00-\x7f]"                 # after accent stripping: anything non-ASCII
@@ -273,6 +273,10 @@ def normalize_frame(df):
         pl.col("name").str.contains(NONLATIN_LETTER).alias("name_nonlatin"),
         pl.col("addr").str.contains(NONLATIN_LETTER).alias("addr_nonlatin"),
     )
+    # native-script fixes (after flags so name_nonlatin/addr_nonlatin keep their meaning)
+    from src.native import fix_states, apply_word_map, load_map
+    df = df.with_columns(fix_states("addr"))
+    df = df.with_columns(apply_word_map(df["name"], load_map()).alias("name"))
     df = df.with_columns(_translit(df["name"]).alias("name"),
                          _translit(df["addr"], latin_free_only=True).alias("addr"))
     return pl.concat([_normalize_country(g, g["cty"][0]) for g in df.partition_by("cty")])
