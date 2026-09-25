@@ -214,13 +214,13 @@ def norm_report(frac=1.0):
     sh = b.select((pl.col("addr_nums_1").list.set_intersection(pl.col("addr_nums")).list.len() > 0)
                   .cast(pl.Float64).mean()).item()
     b2 = j.filter((pl.col("addr_state_1") != "") & (pl.col("addr_state") != ""))
-    ss = b2.select((pl.col("addr_state_1") == pl.col("addr_state")).cast(pl.Float64).mean()).item()
+    ss = b2.select((pl.col("addr_state_1").str.split(" ").list.set_intersection(pl.col("addr_state").str.split(" ")).list.len() > 0).cast(pl.Float64).mean()).item()
     print(f"\nboth have numbers: {b.height / j.height:.1%} | of those share >=1 number: {sh:.1%}")
     print(f"both have state  : {b2.height / j.height:.1%} | of those same state: {ss:.1%}")
     print(f"S2/S3 side: empty addr {j['addr_empty'].mean():.1%} | non-latin name "
           f"{j['name_nonlatin'].mean():.1%} | handle {j['is_handle'].mean():.1%}")
     print("\nstate mismatches (check gazetteer):")
-    print(b2.filter(pl.col("addr_state_1") != pl.col("addr_state")).head(8).select("addr_1", "addr"))
+    print(b2.filter(pl.col("addr_state_1").str.split(" ").list.set_intersection(pl.col("addr_state").str.split(" ")).list.len() == 0).head(8).select("addr_1", "addr"))
 
     ns, asim = res["name core"], res["addr norm"]
     low = ns < 50

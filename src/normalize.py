@@ -16,7 +16,7 @@ from indic_transliteration.sanscript import transliterate
 from src import config as C
 from src import data as D
 
-VERSION = 2          # bump when rules change -> old cache is ignored
+VERSION = 3          # bump when rules change -> old cache is ignored
 CHUNK = 1_000_000
 
 NONLATIN = r"[^\x00-\x7f]"                 # after accent stripping: anything non-ASCII
@@ -61,7 +61,7 @@ def _gaz(spec, with_codes=True):
 # ---------------------------------------------------------------- names
 NAME_MAP = _inv({
     "corp": "corporation corpn", "inc": "incorporated", "co": "company cmpny",
-    "ltd": "limited limitet limitad", "pvt": "private pvte praivet piraivet",
+    "ltd": "limited limitet limitad limidhedh", "pvt": "private pvte praivet piraivet praibhet",
     "cie": "compagnie", "bros": "brothers",
     "intl": "international internationale", "mfg": "manufacturing",
     "assoc": "associates association associes", "tech": "technologies technology technologie",
@@ -76,7 +76,7 @@ LEGAL = ("inc corp co ltd pvt llc lp llp lllp pllc plc pc opc sarl sas sasu sa e
 WEAK = "shri sri shree sree smt the".split()
 NAME_STOP = "and of de des du la le les et da".split()
 SQ_DROP = LEGAL + WEAK + NAME_STOP + ("limited private corporation incorporated company "
-                                      "compagnie praivet piraivet limitet").split()
+                                      "compagnie praivet piraivet limitet praibhet limidhedh").split()
 
 # -------------------------------------------------------------- address
 ADDR_MAP = _inv({
@@ -160,7 +160,7 @@ def _translit_one(t):
         for rx, scheme in _INDIC_RX:
             if rx.search(t):
                 t = transliterate(t, scheme, sanscript.IAST)
-        return _SCHWA.sub("", t)
+        return re.sub("pr[a\u0101]\\s*\\.?\\s*li\\b\\.?", "pvt ltd", _SCHWA.sub("", t))
     except Exception:
         return t
 
@@ -226,7 +226,7 @@ def _normalize_country(df, cty):
     df = df.with_columns(
         _drop(_toks(pl.col("_n")), NULL_TOK).alias("_nt"),
         pl.col("_segs").list.eval(pl.element().filter(pl.element().str.starts_with("~")))
-          .list.first().str.slice(1).fill_null("").alias("addr_state"),
+          .list.eval(pl.element().str.slice(1)).list.unique().list.sort().list.join(" ").alias("addr_state"),
         pl.col("_segs").list.eval(pl.element().filter(
             ~pl.element().str.starts_with("~") & ~pl.element().str.contains(NONLATIN)
             & (pl.element() != ""))).list.join(" ").alias("_a"),
