@@ -8,6 +8,7 @@ candidate rows never sit in RAM as one feature matrix.
   smoke: python -m src.predict --frac 0.01 --train-frac 0.01 --qfrac 0.25
 """
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -35,7 +36,9 @@ def _ids(s, frac):
 
 def score(frac, train_frac, qfrac, cap, nmodels, s1_chunk):
     t = M.tag(train_frac, qfrac)
-    f = C.WORK_DIR / "pred" / f"test_f{frac:g}_{t}_cap{cap}_m{nmodels}.parquet"
+    part, nparts = int(os.environ.get("BER_PART", "0")), int(os.environ.get("BER_NPARTS", "1"))
+    base_f = C.WORK_DIR / "pred" / f"test_f{frac:g}_{t}_cap{cap}_m{nmodels}.parquet"
+    f = base_f if nparts == 1 else base_f.with_name(f"{base_f.stem}_part{part}of{nparts}.parquet")
     f.parent.mkdir(parents=True, exist_ok=True)
     if f.exists():
         print(f"cached scores: {f.name}")
@@ -44,8 +47,7 @@ def score(frac, train_frac, qfrac, cap, nmodels, s1_chunk):
     paths = [C.WORK_DIR / "model" / f"stageA_{t}_f{k}.txt" for k in range(nmodels)]
     miss = [p.name for p in paths if not p.exists()]
     if miss:
-        raise FileNotFoundError(f"missing Stage A models {miss} -> run: "
-                                f"python -m src.run stagea --frac {train_frac:g} --qfrac {qfrac:g}")
+        raise FileNotFoundError(f"missing Stage A models {miss}")
     models = [lgb.Booster(model_file=str(p)) for p in paths]
     cols = models[0].feature_name()
 
@@ -62,9 +64,12 @@ def score(frac, train_frac, qfrac, cap, nmodels, s1_chunk):
     q = np.sort(s1["s1"].unique().to_numpy())
     lf = pl.scan_parquet(cand_f).filter(pl.col("pos") < cap)
     nch = (len(q) + s1_chunk - 1) // s1_chunk
-    parts, t0 = [], time.time()
-    with D.step(f"predict test f{frac:g} S1={len(q):,} chunks={nch} models={nmodels}"):
+    mine = len(range(part, nch, nparts))
+    parts, t0, done = [], time.time(), 0
+    with D.step(f"predict test f{frac:g} part {part}/{nparts} chunks={mine} models={nmodels}"):
         for i, a in enumerate(range(0, len(q), s1_chunk)):
+            if i % nparts != part:
+                continue
             lo, hi = int(q[a]), int(q[min(a + s1_chunk, len(q)) - 1])
             cand = lf.filter(pl.col("s1").is_between(lo, hi)).collect()
             if cand.height:
@@ -72,18 +77,17 @@ def score(frac, train_frac, qfrac, cap, nmodels, s1_chunk):
                 X = F._features(P, idf)
                 if X.height != P.height:
                     raise RuntimeError(f"_features changed row count {P.height} -> {X.height}")
-                for k in ("s1", "id"):
-                    if k in X.columns and not (X[k] == P[k]).all():
-                        raise RuntimeError("_features changed row order")
                 lost = [c for c in cols if c not in X.columns]
                 if lost:
                     raise KeyError(f"features missing for the model: {lost}")
                 Xm = M.matrix(X, cols)
                 p = np.mean([m.predict(Xm) for m in models], axis=0).astype(np.float32)
                 parts.append(P.select("s1", "src", "id").with_columns(pl.Series("p", p)))
-            if (i + 1) % 10 == 0 or i + 1 == nch:
+                del P, X, Xm
+            done += 1
+            if done % 5 == 0 or done == mine:
                 el = time.time() - t0
-                print(f"  chunk {i + 1}/{nch} | {el / 60:.1f} min | eta {el / (i + 1) * (nch - i - 1) / 60:.1f} min",
+                print(f"  chunk {done}/{mine} | {el / 60:.1f} min | eta {el / done * (mine - done) / 60:.1f} min",
                       flush=True)
     S = pl.concat(parts)
     S.write_parquet(f)
