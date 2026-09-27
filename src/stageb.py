@@ -28,7 +28,7 @@ from src import normalize as N
 
 VERSION = 1
 TRAIN_FRAC, QFRAC = 1.0, 0.05
-PRUNE_P, PRUNE_TOP = 0.01, 3
+PRUNE_P, PRUNE_TOP = 0.003, 5
 RIVAL_MAX = 20
 CHUNK = 1_000_000
 KEYS = ["s1", "src", "id"]
